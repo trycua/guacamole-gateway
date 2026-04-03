@@ -1,0 +1,9 @@
+{
+  "name": "guacamole-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "express": "^4.21.0",
+    "guacamole-lite": "^1.2.0"
+  }
+}
