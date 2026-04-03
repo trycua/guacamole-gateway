@@ -38,7 +38,8 @@ const server = http.createServer(app);
 
 app.use('/static', express.static(path.join(__dirname, 'public')));
 
-// Generate encrypted token for guacamole-lite
+// Generate encrypted token using raw crypto (guacamole-lite's Crypt class
+// has a binary encoding bug that corrupts round-trip encrypt/decrypt).
 function generateToken(settings) {
   const connectionConfig = {
     connection: {
@@ -62,28 +63,60 @@ function generateToken(settings) {
   };
 
   const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
-  let encrypted = cipher.update(JSON.stringify(connectionConfig), 'utf8', 'base64');
-  encrypted += cipher.final('base64');
-  return Buffer.from(JSON.stringify({ iv: iv.toString('base64'), value: encrypted })).toString('base64');
+  const key = Buffer.from(ENCRYPTION_KEY);
+  const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify(connectionConfig), 'utf8'), cipher.final()]);
+
+  const data = {
+    iv: iv.toString('base64'),
+    value: encrypted.toString('base64'),
+  };
+  return Buffer.from(JSON.stringify(data)).toString('base64');
 }
 
 // --- Routes ---
 
 // Shared mode: token comes pre-generated in the URL from the website
 // Single-VM mode: server generates token after password check
+// In shared mode, accept ?host=&user=&pass= and generate the token server-side.
+// This avoids cross-process token encoding issues.
 app.get('/', (req, res) => {
   if (SHARED_MODE) {
-    // In shared mode, the token is passed directly from the website
-    const token = req.query.token;
-    if (!token) {
-      return res.status(400).send('Missing token parameter');
+    const rdpHost = req.query.host;
+    const rdpUser = req.query.user || 'admin';
+    const rdpPass = req.query.pass;
+    const gatewayPass = req.query.password;
+
+    // Require either (host+pass) for direct connect, or a pre-generated token
+    if (rdpHost && rdpPass) {
+      // Generate token server-side from query params — same code path as single-VM mode
+      const token = generateToken({
+        hostname: rdpHost,
+        port: parseInt(req.query.port || '3389', 10),
+        username: rdpUser,
+        password: rdpPass,
+        width: parseInt(req.query.width || '1920', 10),
+        height: parseInt(req.query.height || '1080', 10),
+        dpi: parseInt(req.query.dpi || '96', 10),
+      });
+      const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https';
+      const wsProtocol = isSecure ? 'wss' : 'ws';
+      const host = req.headers.host;
+      const wsUrl = `${wsProtocol}://${host}/ws?token=${token}`;
+      return res.send(renderClientPage(wsUrl));
     }
-    const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https';
-    const wsProtocol = isSecure ? 'wss' : 'ws';
-    const host = req.headers.host;
-    const wsUrl = `${wsProtocol}://${host}/ws?token=${encodeURIComponent(token)}`;
-    return res.send(renderClientPage(wsUrl));
+
+    // Legacy: accept pre-generated token
+    const token = req.query.token;
+    if (token) {
+      const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https';
+      const wsProtocol = isSecure ? 'wss' : 'ws';
+      const host = req.headers.host;
+      const wsUrl = `${wsProtocol}://${host}/ws?token=${token}`;
+      return res.send(renderClientPage(wsUrl));
+    }
+
+    return res.status(400).send('Missing connection parameters (host, pass) or token');
   }
 
   // Single-VM mode: check password, generate token
@@ -104,7 +137,7 @@ app.get('/', (req, res) => {
   const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https';
   const wsProtocol = isSecure ? 'wss' : 'ws';
   const host = req.headers.host;
-  const wsUrl = `${wsProtocol}://${host}/ws?token=${encodeURIComponent(token)}`;
+  const wsUrl = `${wsProtocol}://${host}/ws?token=${token}`;
   return res.send(renderClientPage(wsUrl));
 });
 
@@ -265,7 +298,7 @@ function renderClientPage(wsUrl) {
         setStatus('Connection error: ' + (err.message || 'Unknown error'), true);
       };
 
-      client.connect();
+      client.connect('');
     }
 
     connect();
@@ -283,9 +316,19 @@ const guacServer = new GuacamoleLite(
       cypher: 'AES-256-CBC',
       key: ENCRYPTION_KEY,
     },
+    maxInactivityTime: 60000, // 60s — Windows RDP handshake can take 15-30s
     log: { level: 'ERRORS' },
-  }
+  },
+  {}
 );
+
+// Catch uncaught exceptions from guacamole-lite (bad tokens, etc.)
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (non-fatal):', err.message);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection (non-fatal):', err);
+});
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Gateway listening on :${PORT} (${SHARED_MODE ? 'shared' : 'single-vm'} mode)`);
