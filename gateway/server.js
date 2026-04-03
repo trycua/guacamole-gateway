@@ -65,6 +65,16 @@ function generateToken() {
         'enable-wallpaper': RDP_ENABLE_WALLPAPER,
         'resize-method': 'display-update',
         'enable-font-smoothing': 'true',
+        'enable-wallpaper': 'true',
+        'enable-theming': 'true',
+        'enable-desktop-composition': 'true',
+        'enable-full-window-drag': 'true',
+        'enable-menu-animations': 'true',
+        // Audio
+        'enable-audio': 'true',
+        'audio': ['audio/L16', 'audio/L8'],
+        // Clipboard
+        'clipboard-encoding': 'UTF-8',
       },
     },
   };
@@ -113,17 +123,18 @@ function renderClientPage(wsUrl, password) {
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
-    #display { width: 100%; height: 100%; position: absolute; top: 0; left: 0; }
+    #display { width: 100%; height: 100%; position: absolute; top: 0; left: 0; cursor: none; }
+    #display:focus { outline: none; }
     #status {
       position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
       color: #aaa; font-family: system-ui, sans-serif; font-size: 16px;
-      z-index: 10; text-align: center;
+      z-index: 10; text-align: center; pointer-events: none;
     }
     #status.hidden { display: none; }
     #reconnect-btn {
       margin-top: 16px; padding: 8px 24px; border: 1px solid #555;
       background: #222; color: #ccc; font-size: 14px; cursor: pointer;
-      border-radius: 4px; display: none;
+      border-radius: 4px; display: none; pointer-events: auto;
     }
     #reconnect-btn:hover { background: #333; }
   </style>
@@ -133,8 +144,9 @@ function renderClientPage(wsUrl, password) {
     <div id="status-text">Connecting...</div>
     <button id="reconnect-btn" onclick="connect()">Reconnect</button>
   </div>
-  <div id="display"></div>
+  <div id="display" tabindex="0"></div>
 
+  <script>var module = { exports: {} };</script>
   <script src="https://cdn.jsdelivr.net/npm/guacamole-common-js@1.5.0/dist/cjs/guacamole-common.js"></script>
   <script>
     const WS_URL = ${JSON.stringify(wsUrl)};
@@ -166,7 +178,8 @@ function renderClientPage(wsUrl, password) {
       client = new Guacamole.Client(tunnel);
 
       const display = client.getDisplay();
-      displayEl.appendChild(display.getElement());
+      const displayElement = display.getElement();
+      displayEl.appendChild(displayElement);
 
       // Auto-scale display to viewport
       function resize() {
@@ -184,37 +197,46 @@ function renderClientPage(wsUrl, password) {
       display.onresize = resize;
       window.addEventListener('resize', resize);
 
-      // Mouse
-      const mouse = new Guacamole.Mouse(display.getElement());
-      mouse.onEach(['mousedown', 'mousemove', 'mouseup'], (e) => {
+      // Focus the display container so keyboard events work
+      displayEl.focus();
+      displayEl.addEventListener('click', () => displayEl.focus());
+
+      // Mouse — attach to the display element for correct coordinate mapping
+      const mouse = new Guacamole.Mouse(displayElement);
+
+      function sendMouse(mouseState) {
         const scale = display.getScale();
-        client.sendMouseState(
-          Object.assign({}, e, {
-            x: Math.round(e.x / scale),
-            y: Math.round(e.y / scale),
-          })
+        const scaledState = new Guacamole.Mouse.State(
+          mouseState.x / scale,
+          mouseState.y / scale,
+          mouseState.left,
+          mouseState.middle,
+          mouseState.right,
+          mouseState.up,
+          mouseState.down
         );
+        client.sendMouseState(scaledState);
+      }
+
+      mouse.onmousedown = mouse.onmouseup = mouse.onmousemove = sendMouse;
+
+      // Touch support
+      const touch = new Guacamole.Mouse.Touchscreen(displayElement);
+      touch.onmousedown = touch.onmouseup = touch.onmousemove = sendMouse;
+
+      // Keyboard — attach to the display container (needs tabindex + focus)
+      const keyboard = new Guacamole.Keyboard(displayEl);
+      keyboard.onkeydown = (keysym) => { client.sendKeyEvent(1, keysym); };
+      keyboard.onkeyup = (keysym) => { client.sendKeyEvent(0, keysym); };
+
+      // Prevent browser shortcuts from interfering
+      displayEl.addEventListener('keydown', (e) => {
+        // Allow F11 for fullscreen, prevent everything else
+        if (e.key !== 'F11') e.preventDefault();
       });
 
-      // Touch
-      const touch = new Guacamole.Mouse.Touchscreen(display.getElement());
-      touch.onEach(['mousedown', 'mousemove', 'mouseup'], (e) => {
-        const scale = display.getScale();
-        client.sendMouseState(
-          Object.assign({}, e, {
-            x: Math.round(e.x / scale),
-            y: Math.round(e.y / scale),
-          })
-        );
-      });
-
-      // Keyboard
-      const keyboard = new Guacamole.Keyboard(document);
-      keyboard.onkeydown = (keysym) => client.sendKeyEvent(1, keysym);
-      keyboard.onkeyup = (keysym) => client.sendKeyEvent(0, keysym);
-
-      // Clipboard: local -> remote
-      window.addEventListener('paste', (e) => {
+      // Clipboard: local -> remote (Ctrl+V or paste event)
+      displayEl.addEventListener('paste', (e) => {
         const text = (e.clipboardData || window.clipboardData).getData('text');
         if (text) {
           const stream = client.createClipboardStream('text/plain');
@@ -222,6 +244,7 @@ function renderClientPage(wsUrl, password) {
           writer.sendText(text);
           writer.sendEnd();
         }
+        e.preventDefault();
       });
 
       // Clipboard: remote -> local
@@ -234,6 +257,14 @@ function renderClientPage(wsUrl, password) {
             try { navigator.clipboard.writeText(data); } catch (_) {}
           };
         }
+      };
+
+      // Audio support — Guacamole handles audio streams automatically
+      // via the RDP audio channel if 'enable-audio' is set in connection settings.
+      // The browser creates AudioContext on user interaction.
+      client.onaudio = (stream, mimetype) => {
+        const audio = Guacamole.AudioPlayer.getInstance(stream, mimetype);
+        if (audio) stream.sendAck('OK', Guacamole.Status.Code.SUCCESS);
       };
 
       // State changes
