@@ -135,7 +135,7 @@ function renderClientPage(wsUrl, password) {
   </div>
   <div id="display"></div>
 
-  <script src="https://cdn.jsdelivr.net/npm/guacamole-common-js@1.5.5/dist/guacamole-common.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/guacamole-common-js@1.5.0/dist/cjs/guacamole-common.js"></script>
   <script>
     const WS_URL = ${JSON.stringify(wsUrl)};
     const PASSWORD = ${JSON.stringify(password)};
