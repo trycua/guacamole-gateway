@@ -5,64 +5,46 @@ const GuacamoleLite = require('guacamole-lite');
 const path = require('path');
 
 // --- Config from env ---
+const GUACD_HOST = process.env.GUACD_HOST || '127.0.0.1';
+const GUACD_PORT = parseInt(process.env.GUACD_PORT || '4822', 10);
+const PORT = parseInt(process.env.PORT || '8080', 10);
+const SHARED_MODE = process.env.SHARED_MODE === 'true';
+
+// Shared mode: encryption key from env (must match the website's key)
+// Single-VM mode: random key generated at startup
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || crypto.randomBytes(32).toString('base64').slice(0, 32);
+
+// Single-VM mode config (ignored in shared mode)
 const RDP_HOST = process.env.RDP_HOST;
 const RDP_PORT = parseInt(process.env.RDP_PORT || '3389', 10);
 const RDP_USERNAME = process.env.RDP_USERNAME || 'admin';
 const RDP_PASSWORD = process.env.RDP_PASSWORD || 'changeme';
 const GATEWAY_PASSWORD = process.env.GATEWAY_PASSWORD;
-const GUACD_HOST = process.env.GUACD_HOST || '127.0.0.1';
-const GUACD_PORT = parseInt(process.env.GUACD_PORT || '4822', 10);
-const PORT = parseInt(process.env.PORT || '8080', 10);
-const RDP_WIDTH = process.env.RDP_WIDTH || '1920';
-const RDP_HEIGHT = process.env.RDP_HEIGHT || '1080';
-const RDP_DPI = process.env.RDP_DPI || '96';
-const RDP_SECURITY = process.env.RDP_SECURITY || 'any';
-const RDP_IGNORE_CERT = process.env.RDP_IGNORE_CERT || 'true';
-const RDP_DISABLE_AUTH = process.env.RDP_DISABLE_AUTH || 'false';
-const RDP_ENABLE_WALLPAPER = process.env.RDP_ENABLE_WALLPAPER || 'false';
 
-if (!RDP_HOST) {
-  console.error('RDP_HOST environment variable is required');
-  process.exit(1);
+if (!SHARED_MODE) {
+  if (!RDP_HOST) {
+    console.error('RDP_HOST required in single-VM mode (set SHARED_MODE=true for shared gateway)');
+    process.exit(1);
+  }
+  if (!GATEWAY_PASSWORD) {
+    console.error('GATEWAY_PASSWORD required in single-VM mode');
+    process.exit(1);
+  }
 }
-if (!GATEWAY_PASSWORD) {
-  console.error('GATEWAY_PASSWORD environment variable is required');
-  process.exit(1);
-}
-
-// --- Encryption key for guacamole-lite tokens ---
-// guacamole-lite uses Buffer.from(key) directly, so key must be exactly 32 bytes for AES-256-CBC
-const CIPHER_KEY = crypto.randomBytes(32).toString('base64').slice(0, 32);
 
 // --- Express app ---
 const app = express();
 const server = http.createServer(app);
 
-// Serve static files
 app.use('/static', express.static(path.join(__dirname, 'public')));
 
-// Password check middleware
-function checkPassword(req) {
-  return req.query.password === GATEWAY_PASSWORD;
-}
-
 // Generate encrypted token for guacamole-lite
-function generateToken() {
+function generateToken(settings) {
   const connectionConfig = {
     connection: {
       type: 'rdp',
       settings: {
-        hostname: RDP_HOST,
-        port: RDP_PORT,
-        username: RDP_USERNAME,
-        password: RDP_PASSWORD,
-        width: parseInt(RDP_WIDTH, 10),
-        height: parseInt(RDP_HEIGHT, 10),
-        dpi: parseInt(RDP_DPI, 10),
-        security: RDP_SECURITY,
-        'ignore-cert': RDP_IGNORE_CERT,
-        'disable-auth': RDP_DISABLE_AUTH,
-        'enable-wallpaper': RDP_ENABLE_WALLPAPER,
+        ...settings,
         'resize-method': 'display-update',
         'enable-font-smoothing': 'true',
         'enable-wallpaper': 'true',
@@ -70,50 +52,72 @@ function generateToken() {
         'enable-desktop-composition': 'true',
         'enable-full-window-drag': 'true',
         'enable-menu-animations': 'true',
-        // Audio
         'enable-audio': 'true',
         'audio': ['audio/L16', 'audio/L8'],
-        // Clipboard
         'clipboard-encoding': 'UTF-8',
+        security: settings.security || 'any',
+        'ignore-cert': settings['ignore-cert'] || 'true',
       },
     },
   };
 
   const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(CIPHER_KEY), iv);
-
+  const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
   let encrypted = cipher.update(JSON.stringify(connectionConfig), 'utf8', 'base64');
   encrypted += cipher.final('base64');
-
-  const token = JSON.stringify({
-    iv: iv.toString('base64'),
-    value: encrypted,
-  });
-
-  return Buffer.from(token).toString('base64');
+  return Buffer.from(JSON.stringify({ iv: iv.toString('base64'), value: encrypted })).toString('base64');
 }
 
-// Login page
-app.get('/login', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'login.html'));
-});
+// --- Routes ---
 
-// Main route
+// Shared mode: token comes pre-generated in the URL from the website
+// Single-VM mode: server generates token after password check
 app.get('/', (req, res) => {
-  if (!checkPassword(req)) {
-    return res.redirect('/login');
+  if (SHARED_MODE) {
+    // In shared mode, the token is passed directly from the website
+    const token = req.query.token;
+    if (!token) {
+      return res.status(400).send('Missing token parameter');
+    }
+    const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https';
+    const wsProtocol = isSecure ? 'wss' : 'ws';
+    const host = req.headers.host;
+    const wsUrl = `${wsProtocol}://${host}/ws?token=${encodeURIComponent(token)}`;
+    return res.send(renderClientPage(wsUrl));
   }
 
-  const token = generateToken();
+  // Single-VM mode: check password, generate token
+  if (req.query.password !== GATEWAY_PASSWORD) {
+    return res.sendFile(path.join(__dirname, 'public', 'login.html'));
+  }
+
+  const token = generateToken({
+    hostname: RDP_HOST,
+    port: RDP_PORT,
+    username: RDP_USERNAME,
+    password: RDP_PASSWORD,
+    width: parseInt(process.env.RDP_WIDTH || '1920', 10),
+    height: parseInt(process.env.RDP_HEIGHT || '1080', 10),
+    dpi: parseInt(process.env.RDP_DPI || '96', 10),
+  });
+
   const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https';
   const wsProtocol = isSecure ? 'wss' : 'ws';
   const host = req.headers.host;
   const wsUrl = `${wsProtocol}://${host}/ws?token=${encodeURIComponent(token)}`;
-
-  res.send(renderClientPage(wsUrl, req.query.password));
+  return res.send(renderClientPage(wsUrl));
 });
 
-function renderClientPage(wsUrl, password) {
+app.get('/login', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'login.html'));
+});
+
+// Health check
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', mode: SHARED_MODE ? 'shared' : 'single-vm' });
+});
+
+function renderClientPage(wsUrl) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -150,7 +154,6 @@ function renderClientPage(wsUrl, password) {
   <script src="https://cdn.jsdelivr.net/npm/guacamole-common-js@1.5.0/dist/cjs/guacamole-common.js"></script>
   <script>
     const WS_URL = ${JSON.stringify(wsUrl)};
-    const PASSWORD = ${JSON.stringify(password)};
 
     const statusEl = document.getElementById('status');
     const statusText = document.getElementById('status-text');
@@ -166,7 +169,6 @@ function renderClientPage(wsUrl, password) {
     }
 
     function connect() {
-      // Clean up previous
       if (client) {
         try { client.disconnect(); } catch (_) {}
         displayEl.innerHTML = '';
@@ -181,7 +183,6 @@ function renderClientPage(wsUrl, password) {
       const displayElement = display.getElement();
       displayEl.appendChild(displayElement);
 
-      // Auto-scale display to viewport
       function resize() {
         const w = window.innerWidth;
         const h = window.innerHeight;
@@ -197,45 +198,32 @@ function renderClientPage(wsUrl, password) {
       display.onresize = resize;
       window.addEventListener('resize', resize);
 
-      // Focus the display container so keyboard events work
       displayEl.focus();
       displayEl.addEventListener('click', () => displayEl.focus());
 
-      // Mouse — attach to the display element for correct coordinate mapping
       const mouse = new Guacamole.Mouse(displayElement);
-
       function sendMouse(mouseState) {
         const scale = display.getScale();
         const scaledState = new Guacamole.Mouse.State(
-          mouseState.x / scale,
-          mouseState.y / scale,
-          mouseState.left,
-          mouseState.middle,
-          mouseState.right,
-          mouseState.up,
-          mouseState.down
+          mouseState.x / scale, mouseState.y / scale,
+          mouseState.left, mouseState.middle, mouseState.right,
+          mouseState.up, mouseState.down
         );
         client.sendMouseState(scaledState);
       }
-
       mouse.onmousedown = mouse.onmouseup = mouse.onmousemove = sendMouse;
 
-      // Touch support
       const touch = new Guacamole.Mouse.Touchscreen(displayElement);
       touch.onmousedown = touch.onmouseup = touch.onmousemove = sendMouse;
 
-      // Keyboard — attach to the display container (needs tabindex + focus)
       const keyboard = new Guacamole.Keyboard(displayEl);
       keyboard.onkeydown = (keysym) => { client.sendKeyEvent(1, keysym); };
       keyboard.onkeyup = (keysym) => { client.sendKeyEvent(0, keysym); };
 
-      // Prevent browser shortcuts from interfering
       displayEl.addEventListener('keydown', (e) => {
-        // Allow F11 for fullscreen, prevent everything else
         if (e.key !== 'F11') e.preventDefault();
       });
 
-      // Clipboard: local -> remote (Ctrl+V or paste event)
       displayEl.addEventListener('paste', (e) => {
         const text = (e.clipboardData || window.clipboardData).getData('text');
         if (text) {
@@ -247,7 +235,6 @@ function renderClientPage(wsUrl, password) {
         e.preventDefault();
       });
 
-      // Clipboard: remote -> local
       client.onclipboard = (stream, mimetype) => {
         if (mimetype === 'text/plain') {
           const reader = new Guacamole.StringReader(stream);
@@ -259,27 +246,17 @@ function renderClientPage(wsUrl, password) {
         }
       };
 
-      // Audio support — Guacamole handles audio streams automatically
-      // via the RDP audio channel if 'enable-audio' is set in connection settings.
-      // The browser creates AudioContext on user interaction.
       client.onaudio = (stream, mimetype) => {
         const audio = Guacamole.AudioPlayer.getInstance(stream, mimetype);
         if (audio) stream.sendAck('OK', Guacamole.Status.Code.SUCCESS);
       };
 
-      // State changes
       client.onstatechange = (state) => {
         switch (state) {
           case 1: setStatus('Connecting...', false); break;
           case 2: setStatus('Waiting for response...', false); break;
-          case 3:
-            statusEl.classList.add('hidden');
-            resize();
-            break;
-          case 4: // Disconnecting
-          case 5:
-            setStatus('Disconnected.', true);
-            break;
+          case 3: statusEl.classList.add('hidden'); resize(); break;
+          case 4: case 5: setStatus('Disconnected.', true); break;
         }
       };
 
@@ -297,20 +274,20 @@ function renderClientPage(wsUrl, password) {
 </html>`;
 }
 
-// --- Start guacamole-lite WebSocket handler ---
+// --- guacamole-lite WebSocket handler ---
 const guacServer = new GuacamoleLite(
   { server, path: '/ws' },
   { host: GUACD_HOST, port: GUACD_PORT },
   {
     crypt: {
       cypher: 'AES-256-CBC',
-      key: CIPHER_KEY,
+      key: ENCRYPTION_KEY,
     },
     log: { level: 'ERRORS' },
   }
 );
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Gateway listening on :${PORT}`);
-  console.log(`RDP target: ${RDP_HOST}:${RDP_PORT}`);
+  console.log(`Gateway listening on :${PORT} (${SHARED_MODE ? 'shared' : 'single-vm'} mode)`);
+  if (!SHARED_MODE) console.log(`RDP target: ${RDP_HOST}:${RDP_PORT}`);
 });
